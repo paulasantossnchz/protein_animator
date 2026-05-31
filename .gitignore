@@ -1,0 +1,51 @@
+# ==========================================
+# 1. Archivos temporales y de Python
+# ==========================================
+# Evita subir el código compilado en caché que genera Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignora los entornos virtuales donde instalas tus librerías (Biopython, Streamlit, etc.)
+venv/
+env/
+.env
+
+# ==========================================
+# 2. Datos biológicos y resultados (Crucial)
+# ==========================================
+# Ignorar todos los archivos dentro de las carpetas de datos, 
+# pero mantener la estructura de carpetas en GitHub usando un archivo vacío .gitkeep
+data/input_pdbs/*
+!data/input_pdbs/.gitkeep
+
+data/output_animations/*
+!data/output_animations/.gitkeep
+
+# Extensiones de archivos estructurales y de secuencia que pudiesen quedar sueltos
+*.pdb
+*.cif
+*.ent
+*.fasta
+*.fa
+*.aln
+*.xml
+
+# Extensiones de los renders y animaciones generadas
+*.gif
+*.mp4
+*.pse  # Sesiones de PyMOL si decides guardarlas
+
+# ==========================================
+# 3. Configuraciones de la Interfaz y el IDE
+# ==========================================
+# Caché de Streamlit (si optas por la interfaz web)
+.streamlit/
+.cache/
+
+# Configuraciones locales de Visual Studio Code
+.vscode/
+
+# Archivos basura del sistema operativo (macOS y Windows)
+.DS_Store
+Thumbs.db
