@@ -1,2 +1,6 @@
 biopython
 requests
+numpy
+pillow
+gradio
+pymol-open-source   # alternativa conda: conda install -c conda-forge pymol-open-source

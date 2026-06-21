@@ -25,19 +25,18 @@ _RCSB_DOWNLOAD_URL   = "https://files.rcsb.org/download/{code}.pdb"
 
 # ── Auxiliary functions ───────────────────────────────────────────────────────
 
-def _extract_pdb_code(hit_id: str) -> str:
+def _extract_pdb_entry(hit_id: str) -> str:
     """
-    Return the 4-letter PDB accession from a BLAST hit identifier.
+    Return a CODE_CHAIN string from a BLAST hit identifier.
 
     BLAST returns PDB hits with IDs like 'pdb|1ABC|A'; this function
-    isolates the accession portion regardless of the number of '|' fields.
+    extracts both the accession and the chain letter.
+    Chain defaults to 'A' when absent from the identifier.
     """
     parts = hit_id.split("|")
-    if len(parts) >= 2:
-        code = parts[1][:4].upper()
-    else:
-        code = hit_id[:4].upper()
-    return code
+    code  = parts[1][:4].upper() if len(parts) >= 2 else hit_id[:4].upper()
+    chain = parts[2].strip().upper() if (len(parts) >= 3 and parts[2].strip()) else "A"
+    return f"{code}_{chain}"
 
 
 def _parse_first_fasta_sequence(fasta_text: str) -> str:
@@ -95,14 +94,21 @@ def _build_rcsb_homolog_query(
     identity_cutoff: float,
     evalue_cutoff: float,
     resolution_cutoff: float,
+    max_results: int,
 ) -> dict:
     """
     Build the RCSB Search API v2 JSON query that combines sequence similarity
     with a crystallographic resolution filter.
 
+    The return type is "polymer_instance" (not "entry") so the API reports the
+    exact chain that matched the sequence search, e.g. "1G4Y.B".  Assuming
+    chain A would silently load the wrong polymer in complexes where the
+    homolog sits on chain B/C/…, which breaks the downstream atom matching.
+
     identity_cutoff  : value in [0, 1] (e.g. 0.30 for 30 %).
     evalue_cutoff    : maximum E-value accepted by the sequence service.
     resolution_cutoff: maximum resolution in Å for the attribute filter.
+    max_results      : maximum number of chain hits to request (top by score).
     """
     sequence_node = {
         "type": "terminal",
@@ -132,9 +138,10 @@ def _build_rcsb_homolog_query(
             "logical_operator": "and",
             "nodes":            [sequence_node, resolution_node],
         },
-        "return_type": "entry",
+        "return_type": "polymer_instance",
         "request_options": {
-            "return_all_hits": True,
+            "paginate": {"start": 0, "rows": max_results},
+            "sort":     [{"sort_by": "score", "direction": "desc"}],
         },
     }
 
@@ -185,9 +192,9 @@ def blast_fasta_vs_pdb(
                     )
 
                     if passes_filter:
-                        pdb_code = _extract_pdb_code(alignment.hit_id)
-                        if pdb_code not in filtered_pdbs:
-                            filtered_pdbs.append(pdb_code)
+                        pdb_entry = _extract_pdb_entry(alignment.hit_id)
+                        if pdb_entry not in filtered_pdbs:
+                            filtered_pdbs.append(pdb_entry)
 
     except Exception as exc:
         print(f"[blast_fasta_vs_pdb] BLAST error: {exc}")
@@ -201,6 +208,7 @@ def search_homologs_rcsb(
     identity_cutoff: float  = 0.30,
     evalue_cutoff: float    = 1.0,
     resolution_cutoff: float = 3.0,
+    max_results: int        = 15,
 ) -> list:
     """
     Query the RCSB PDB Search API for structures homologous to *pdb_code*.
@@ -209,35 +217,48 @@ def search_homologs_rcsb(
     from RCSB, then issues a combined query that enforces both sequence
     similarity and a crystallographic resolution limit.
 
+    Hits are returned as 'CODE_CHAIN' strings using the chain that actually
+    matched the search (e.g. '1G4Y_B'), the query structure is excluded, and
+    only the first matching chain of each PDB entry is kept (so a structure
+    with several homologous copies does not flood the animation with near
+    duplicates).
+
     Parameters
     ----------
     pdb_code          : 4-letter PDB identifier of the reference structure.
     identity_cutoff   : Minimum sequence identity in [0, 1] (default 0.30 = 30 %).
     evalue_cutoff     : Maximum E-value for the sequence search (default 1.0).
     resolution_cutoff : Maximum resolution in Å for returned structures (default 3.0 Å).
+    max_results       : Maximum number of chain hits to request (default 15).
 
     Returns
     -------
-    List of PDB entry identifiers (excluding *pdb_code* itself), or an empty
+    List of 'CODE_CHAIN' identifiers (excluding *pdb_code* itself), or an empty
     list if the sequence cannot be fetched or the API call fails.
     """
-    homologs = []
+    homologs   = []
+    seen_codes = set()
 
     sequence = _fetch_pdb_sequence(pdb_code)
 
     if sequence:
         try:
             query    = _build_rcsb_homolog_query(
-                sequence, identity_cutoff, evalue_cutoff, resolution_cutoff
+                sequence, identity_cutoff, evalue_cutoff,
+                resolution_cutoff, max_results,
             )
             response = requests.post(_RCSB_SEARCH_URL, json=query, timeout=30)
 
             if response.status_code == 200:
                 data = response.json()
                 for result in data.get("result_set", []):
-                    identifier = result.get("identifier", "").upper()
-                    is_query   = (identifier == pdb_code.upper())
-                    if identifier and not is_query:
+                    # polymer_instance identifiers look like '1G4Y.B'
+                    identifier = result.get("identifier", "").upper().replace(".", "_")
+                    code       = identifier.split("_")[0]
+                    is_query   = (code == pdb_code.upper()[:4])
+                    is_new     = (code not in seen_codes)
+                    if identifier and not is_query and is_new:
+                        seen_codes.add(code)
                         homologs.append(identifier)
             else:
                 print(
@@ -259,11 +280,15 @@ def search_homologs_rcsb(
 
 
 def download_pdbs(
-    pdb_codes: list,
+    pdb_entries: list,
     output_dir: str = _DEFAULT_OUTPUT_DIR,
 ) -> list:
     """
-    Download a .pdb file for each code in *pdb_codes* and save to *output_dir*.
+    Download a .pdb file for each entry in *pdb_entries* and save to *output_dir*.
+
+    Each entry may be a plain 4-letter code ('1ABC') or include a chain
+    ('1ABC_A').  The chain is preserved and paired with the downloaded file
+    path so the caller can later filter atoms to the correct chain.
 
     Files are opened with the classic open()/close() pattern (no context
     manager). A try/finally block guarantees the file handle is always closed
@@ -271,18 +296,20 @@ def download_pdbs(
 
     Parameters
     ----------
-    pdb_codes  : Iterable of 4-letter PDB identifiers.
-    output_dir : Destination directory; created automatically if absent.
+    pdb_entries : Iterable of identifiers in '1ABC' or '1ABC_A' format.
+    output_dir  : Destination directory; created automatically if absent.
 
     Returns
     -------
-    List of PDB codes that were successfully written to disk.
+    List of (filepath, chain) tuples for entries successfully written to disk.
     """
     os.makedirs(output_dir, exist_ok=True)
     downloaded = []
 
-    for code in pdb_codes:
-        code_upper = code.upper()
+    for entry in pdb_entries:
+        parts      = entry.upper().split("_")
+        code_upper = parts[0][:4]
+        chain      = parts[1] if len(parts) >= 2 else "A"
         url        = _RCSB_DOWNLOAD_URL.format(code=code_upper)
         filepath   = os.path.join(output_dir, f"{code_upper}.pdb")
 
@@ -296,8 +323,8 @@ def download_pdbs(
                 finally:
                     archivo.close()
 
-                downloaded.append(code_upper)
-                print(f"[download_pdbs] {code_upper} → {filepath}")
+                downloaded.append((filepath, chain))
+                print(f"[download_pdbs] {code_upper} chain {chain} → {filepath}")
 
             else:
                 print(
