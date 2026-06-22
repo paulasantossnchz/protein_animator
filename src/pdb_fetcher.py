@@ -11,6 +11,7 @@ download_pdbs        : Download .pdb files for a list of PDB codes.
 """
 
 import os
+import time
 import requests
 from Bio.Blast import NCBIWWW, NCBIXML
 
@@ -21,9 +22,52 @@ _DEFAULT_OUTPUT_DIR  = os.path.join("data", "input_pdbs")
 _RCSB_FASTA_URL      = "https://www.rcsb.org/fasta/entry/{code}/download"
 _RCSB_SEARCH_URL     = "https://search.rcsb.org/rcsbsearch/v2/query"
 _RCSB_DOWNLOAD_URL   = "https://files.rcsb.org/download/{code}.pdb"
+_MAX_RETRIES         = 3
+_RETRY_BACKOFF       = 2.0   # segundos base entre reintentos (escala con el intento)
 
 
 # ── Auxiliary functions ───────────────────────────────────────────────────────
+
+def _http_with_retries(method: str, url: str, timeout: int, retries: int = _MAX_RETRIES, **kwargs):
+    """
+    Perform an HTTP request retrying on transient failures.
+
+    The RCSB endpoints occasionally answer a successful query with a sporadic
+    HTTP 4xx/5xx or drop the connection; retrying the identical request a few
+    times with a short, increasing back-off recovers from those glitches and
+    prevents the pipeline from wrongly reporting "no homologs".
+
+    Returns the last Response obtained (its status_code is 200 on success), or
+    None if every attempt raised a connection error.
+    """
+    response  = None
+    attempt   = 0
+    succeeded = False
+
+    while attempt < retries and not succeeded:
+        try:
+            response = requests.request(method, url, timeout=timeout, **kwargs)
+            if response.status_code == 200:
+                succeeded = True
+            else:
+                print(
+                    f"[_http_with_retries] HTTP {response.status_code} en "
+                    f"{url} (intento {attempt + 1}/{retries})."
+                )
+        except Exception as exc:
+            print(
+                f"[_http_with_retries] Error de conexión en {url} "
+                f"(intento {attempt + 1}/{retries}): {exc}"
+            )
+            response = None
+
+        is_last = (attempt >= retries - 1)
+        if not succeeded and not is_last:
+            time.sleep(_RETRY_BACKOFF * (attempt + 1))
+
+        attempt = attempt + 1
+
+    return response
 
 def _extract_pdb_entry(hit_id: str) -> str:
     """
@@ -74,17 +118,11 @@ def _fetch_pdb_sequence(pdb_code: str) -> str:
     sequence = ""
     url = _RCSB_FASTA_URL.format(code=pdb_code.upper())
 
-    try:
-        response = requests.get(url, timeout=15)
-        if response.status_code == 200:
-            sequence = _parse_first_fasta_sequence(response.text)
-        else:
-            print(
-                f"[_fetch_pdb_sequence] HTTP {response.status_code} "
-                f"while fetching FASTA for {pdb_code}."
-            )
-    except Exception as exc:
-        print(f"[_fetch_pdb_sequence] Connection error for {pdb_code}: {exc}")
+    response = _http_with_retries("GET", url, 15)
+    if response is not None and response.status_code == 200:
+        sequence = _parse_first_fasta_sequence(response.text)
+    else:
+        print(f"[_fetch_pdb_sequence] No se pudo obtener la FASTA de {pdb_code}.")
 
     return sequence
 
@@ -247,9 +285,9 @@ def search_homologs_rcsb(
                 sequence, identity_cutoff, evalue_cutoff,
                 resolution_cutoff, max_results,
             )
-            response = requests.post(_RCSB_SEARCH_URL, json=query, timeout=30)
+            response = _http_with_retries("POST", _RCSB_SEARCH_URL, 30, json=query)
 
-            if response.status_code == 200:
+            if response is not None and response.status_code == 200:
                 data = response.json()
                 for result in data.get("result_set", []):
                     # polymer_instance identifiers look like '1G4Y.B'
@@ -261,9 +299,10 @@ def search_homologs_rcsb(
                         seen_codes.add(code)
                         homologs.append(identifier)
             else:
+                status_code = response.status_code if response is not None else "sin respuesta"
                 print(
-                    f"[search_homologs_rcsb] RCSB Search API returned "
-                    f"HTTP {response.status_code} for query on {pdb_code}."
+                    f"[search_homologs_rcsb] La búsqueda RCSB falló tras "
+                    f"{_MAX_RETRIES} intentos (HTTP {status_code}) para {pdb_code}."
                 )
 
         except Exception as exc:
@@ -314,9 +353,9 @@ def download_pdbs(
         filepath   = os.path.join(output_dir, f"{code_upper}.pdb")
 
         try:
-            response = requests.get(url, timeout=30)
+            response = _http_with_retries("GET", url, 30)
 
-            if response.status_code == 200:
+            if response is not None and response.status_code == 200:
                 archivo = open(filepath, "w", encoding="utf-8")
                 try:
                     archivo.write(response.text)
@@ -327,8 +366,9 @@ def download_pdbs(
                 print(f"[download_pdbs] {code_upper} chain {chain} → {filepath}")
 
             else:
+                status_code = response.status_code if response is not None else "sin respuesta"
                 print(
-                    f"[download_pdbs] HTTP {response.status_code} "
+                    f"[download_pdbs] HTTP {status_code} "
                     f"for {code_upper}; skipping."
                 )
 
